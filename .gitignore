@@ -1,0 +1,43 @@
+# Build artifacts
+bin/
+local-pipeline
+*.exe
+
+# Runtime data
+stag-data/
+test-data/
+*-data/
+*.db
+*.bolt
+
+# Logs
+*.log
+*.pid
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Go specific
+vendor/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test outputs
+test-output/
+coverage.out
+*.test
+
+# Development artifacts
+debug
+profile.out
