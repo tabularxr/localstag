@@ -5,6 +5,7 @@ local-pipeline
 
 # Runtime data
 stag-data/
+stag-data
 test-data/
 *-data/
 *.db
