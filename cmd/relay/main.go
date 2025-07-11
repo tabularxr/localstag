@@ -52,8 +52,8 @@ func main() {
 	}
 
 	// Initialize logger
-	logger := logging.NewLogger(*logLevel)
-	logger.Info("Starting Tabular Local Relay Service",
+	logger := logging.NewLogger(*logLevel, "relay")
+	logger.Info("🚀 Starting Tabular Local Relay Service",
 		"version", version,
 		"port", *port,
 		"stag_endpoint", *stagEndpoint,
@@ -97,7 +97,7 @@ func main() {
 
 	// Start server in goroutine
 	go func() {
-		logger.Info("🚀 Relay service started",
+		logger.Info("🌍 Relay service started",
 			"port", cfg.Port,
 			"websocket_url", fmt.Sprintf("ws://%s:%d/ws/streamkit", lanIP, cfg.Port),
 			"local_url", fmt.Sprintf("ws://localhost:%d/ws/streamkit", cfg.Port),
@@ -115,7 +115,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	logger.Info("Shutting down server...")
+	logger.Info("🛴 Shutting down server...")
 
 	// Graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -126,7 +126,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("Server stopped successfully")
+	logger.Info("✅ Server stopped successfully")
 }
 
 func getLANIP() (string, error) {

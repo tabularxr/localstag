@@ -46,8 +46,8 @@ func main() {
 	}
 
 	// Initialize logger
-	logger := logging.NewLogger(*logLevel)
-	logger.Info("Starting Tabular Local Stag Service",
+	logger := logging.NewLogger(*logLevel, "stag")
+	logger.Info("🚀 Starting Tabular Local Stag Service",
 		"version", version,
 		"port", *port,
 		"db_path", *dbPath,

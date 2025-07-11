@@ -1,34 +1,77 @@
 package stag
 
 import (
-	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/tabular/local-pipeline/internal/logging"
+	"github.com/tabular/local-pipeline/internal/performance"
 	"github.com/tabular/local-pipeline/internal/storage"
 )
 
 type Service struct {
-	store     storage.Storage
-	logger    *logging.Logger
-	StartTime time.Time
+	store           storage.Storage
+	logger          *logging.Logger
+	StartTime       time.Time
+	batchProcessor  *performance.BatchProcessor
+	processingMutex sync.RWMutex
+	healthChecker   *HealthChecker
+}
+
+type HealthChecker struct {
+	mu              sync.RWMutex
+	stagHealth      map[string]*StagHealth
+	lastHealthCheck time.Time
+}
+
+type StagHealth struct {
+	ID              string
+	Healthy         bool
+	LastActivity    time.Time
+	AnchorCount     int
+	ErrorCount      int
+	LastError       error
+	LastErrorTime   time.Time
+	ProcessingRate  float64
+	LastChecked     time.Time
 }
 
 func NewService(store storage.Storage, logger *logging.Logger) *Service {
-	return &Service{
+	s := &Service{
 		store:     store,
 		logger:    logger,
 		StartTime: time.Now(),
+		healthChecker: &HealthChecker{
+			stagHealth:      make(map[string]*StagHealth),
+			lastHealthCheck: time.Now(),
+		},
 	}
+	
+	// Initialize batch processor for performance
+	s.batchProcessor = performance.NewBatchProcessor(
+		logger,
+		50, // batch size
+		100*time.Millisecond, // flush timeout
+		s.processBatch,
+	)
+	
+	// Start health monitoring
+	go s.startHealthMonitoring()
+	
+	return s
 }
 
 func (s *Service) HandleIngest(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now()
+	stopTimer := s.logger.StartTimer()
+	defer func() {
+		duration := stopTimer()
+		s.logger.Debug("Ingest request completed", "duration", duration)
+	}()
 	
 	// Parse request body
 	var batch storage.IngestBatch
@@ -38,32 +81,39 @@ func (s *Service) HandleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Info("Received ingest batch", 
-		"batch_id", batch.BatchID,
+	traceID := logging.GenerateTraceID()
+	ctx := &logging.PipelineContext{
+		TraceID:   traceID,
+		BatchID:   batch.BatchID,
+		Component: "stag-ingest",
+	}
+
+	s.logger.PipelineInfo(ctx, "🚀 Ingest batch received", 
 		"event_count", len(batch.Events),
 		"relay_id", batch.RelayID,
 	)
 
-	// Process events
+	// Add events to batch processor for performance
 	processed := 0
-	errors := 0
-	
-	for _, event := range batch.Events {
-		if err := s.processEvent(&event); err != nil {
-			s.logger.Error("Failed to process event", 
-				"event_id", event.EventID,
-				"error", err,
-			)
-			errors++
-		} else {
-			processed++
+	for i := range batch.Events {
+		batch.Events[i].ProcessingInfo.ReceivedAt = time.Now()
+		batch.Events[i].ProcessingInfo.ProcessedAt = time.Now()
+		batch.Events[i].ProcessingInfo.Relay = batch.RelayID
+		
+		// Add trace ID to event metadata
+		if batch.Events[i].Metadata == nil {
+			batch.Events[i].Metadata = make(map[string]interface{})
 		}
+		batch.Events[i].Metadata["trace_id"] = traceID
+		
+		s.batchProcessor.Add(&batch.Events[i])
+		processed++
 	}
 
 	// Update system stats
 	stats, err := s.store.GetSystemStats()
 	if err != nil {
-		s.logger.Error("Failed to get system stats", "error", err)
+		s.logger.PipelineWarn(ctx, "Failed to get system stats", "error", err)
 		stats = &storage.SystemStats{
 			StartTime: s.StartTime,
 		}
@@ -73,28 +123,63 @@ func (s *Service) HandleIngest(w http.ResponseWriter, r *http.Request) {
 	stats.LastIngestTime = time.Now()
 	
 	if err := s.store.UpdateSystemStats(stats); err != nil {
-		s.logger.Error("Failed to update system stats", "error", err)
+		s.logger.PipelineError(ctx, "Failed to update system stats", "error", err)
 	}
 
 	// Response
-	processingTime := time.Since(startTime)
 	response := map[string]interface{}{
-		"batch_id":        batch.BatchID,
-		"processed":       processed,
-		"errors":          errors,
-		"processing_time": processingTime.String(),
-		"timestamp":       time.Now().Format(time.RFC3339),
+		"batch_id":   batch.BatchID,
+		"processed":  processed,
+		"errors":     0, // Errors reported asynchronously
+		"queued":     true,
+		"trace_id":   traceID,
+		"timestamp":  time.Now().Format(time.RFC3339),
 	}
 
-	s.logger.Info("Processed ingest batch",
-		"batch_id", batch.BatchID,
-		"processed", processed,
-		"errors", errors,
-		"processing_time", processingTime,
-	)
+	s.logger.PipelineInfo(ctx, "✅ Ingest batch queued", "processed", processed)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// New batch processing method for performance
+func (s *Service) processBatch(events []*storage.SpatialEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	
+	ctx := &logging.PipelineContext{
+		Component: "stag-batch-processor",
+	}
+	
+	s.logger.PipelineInfo(ctx, "🔄 Processing event batch", "batch_size", len(events))
+	
+	processed := 0
+	errors := 0
+	
+	for _, event := range events {
+		if err := s.processEvent(event); err != nil {
+			eventCtx := &logging.PipelineContext{
+				TraceID:   fmt.Sprintf("%v", event.Metadata["trace_id"]),
+				EventType: event.EventType,
+				ClientID:  event.ClientID,
+				StagID:    event.SessionID,
+				Component: "stag-batch-processor",
+			}
+			s.logger.PipelineError(eventCtx, "Event processing failed", "error", err)
+			errors++
+		} else {
+			processed++
+		}
+	}
+	
+	s.logger.PipelineInfo(ctx, "✅ Batch processing completed", 
+		"processed", processed, 
+		"errors", errors,
+		"success_rate", fmt.Sprintf("%.1f%%", float64(processed)/float64(len(events))*100),
+	)
+	
+	return nil
 }
 
 func (s *Service) processEvent(event *storage.SpatialEvent) error {
@@ -207,8 +292,22 @@ func (s *Service) processGenericEvent(stag *storage.Stag, event *storage.Spatial
 }
 
 func (s *Service) processAnchorEvent(stag *storage.Stag, anchorID string, event *storage.SpatialEvent) error {
-	// Calculate content hash for change detection
-	contentHash := s.calculateEventHash(event)
+	// Use optimized hashing for performance
+	hasher := performance.GetHasher()
+	defer performance.PutHasher(hasher)
+	contentHash := hasher.CalculateEventHash(event)
+	
+	// Create context for logging
+	ctx := &logging.PipelineContext{
+		TraceID:     fmt.Sprintf("%v", event.Metadata["trace_id"]),
+		StagID:      stag.ID,
+		AnchorID:    anchorID,
+		EventType:   event.EventType,
+		ClientID:    event.ClientID,
+		SessionID:   event.SessionID,
+		FrameNumber: event.FrameNumber,
+		Component:   "stag-anchor-processor",
+	}
 	
 	// Get or create anchor
 	anchor, err := s.store.GetAnchor(stag.ID, anchorID)
@@ -229,21 +328,26 @@ func (s *Service) processAnchorEvent(stag *storage.Stag, anchorID string, event 
 			return fmt.Errorf("failed to create anchor: %w", err)
 		}
 		
-		s.logger.Info("Created new anchor", 
-			"stag_id", stag.ID,
-			"anchor_id", anchorID,
-			"event_type", event.EventType,
-		)
+		s.logger.PipelineInfo(ctx, "🆕 Created new anchor")
+		
+		// Update stag health
+		s.updateStagHealth(stag.ID, true, nil)
 	}
 
 	// Check if content has changed
 	if anchor.CurrentHash == contentHash {
-		s.logger.Debug("Anchor content unchanged, skipping version",
-			"stag_id", stag.ID,
-			"anchor_id", anchorID,
-			"hash", contentHash,
-		)
+		s.logger.PipelineDebug(ctx, "🔄 Content unchanged, skipping version", "hash", contentHash[:8])
 		return nil
+	}
+	
+	// For mesh data, also check geometric signature
+	if event.EventType == "mesh" && event.MeshData != nil {
+		geomSig := performance.CalculateGeometrySignature(event.MeshData)
+		if anchor.Metadata["geom_signature"] == geomSig {
+			s.logger.PipelineDebug(ctx, "🔄 Geometry unchanged, skipping version", "geom_sig", geomSig)
+			return nil
+		}
+		anchor.Metadata["geom_signature"] = geomSig
 	}
 
 	// Create new version
@@ -313,68 +417,101 @@ func (s *Service) processAnchorEvent(stag *storage.Stag, anchorID string, event 
 		return fmt.Errorf("failed to update stag stats: %w", err)
 	}
 
-	s.logger.Info("Updated anchor", 
-		"stag_id", stag.ID,
-		"anchor_id", anchorID,
-		"event_type", event.EventType,
+	s.logger.PipelineInfo(ctx, "✅ Updated anchor", 
 		"version_id", version.VersionID,
 		"change_type", version.ChangeType,
+		"hash", contentHash[:8],
 	)
+	
+	// Update stag health
+	s.updateStagHealth(stag.ID, true, nil)
 
 	return nil
 }
 
-func (s *Service) calculateEventHash(event *storage.SpatialEvent) string {
-	// Create a hash of the event content for change detection
-	hasher := md5.New()
+// Health monitoring methods
+func (s *Service) updateStagHealth(stagID string, healthy bool, err error) {
+	s.healthChecker.mu.Lock()
+	defer s.healthChecker.mu.Unlock()
 	
-	// Include relevant fields in hash
-	hasher.Write([]byte(event.EventType))
-	hasher.Write([]byte(fmt.Sprintf("%d", event.FrameNumber)))
-	
-	if event.Transform != nil {
-		hasher.Write([]byte(fmt.Sprintf("%v", event.Transform)))
+	health, exists := s.healthChecker.stagHealth[stagID]
+	if !exists {
+		health = &StagHealth{
+			ID:           stagID,
+			LastActivity: time.Now(),
+		}
+		s.healthChecker.stagHealth[stagID] = health
 	}
 	
-	if event.MeshData != nil {
-		hasher.Write([]byte(fmt.Sprintf("%v", event.MeshData.Vertices)))
-		hasher.Write([]byte(fmt.Sprintf("%v", event.MeshData.Faces)))
+	health.Healthy = healthy
+	health.LastActivity = time.Now()
+	health.LastChecked = time.Now()
+	
+	if err != nil {
+		health.ErrorCount++
+		health.LastError = err
+		health.LastErrorTime = time.Now()
+		health.Healthy = false
 	}
 	
-	if event.PoseData != nil {
-		hasher.Write([]byte(fmt.Sprintf("%v", event.PoseData.Transform)))
+	// Get anchor count
+	if stag, stagErr := s.store.GetStag(stagID); stagErr == nil {
+		health.AnchorCount = len(stag.Anchors)
+	}
+}
+
+func (s *Service) startHealthMonitoring() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		s.performHealthCheck()
+	}
+}
+
+func (s *Service) performHealthCheck() {
+	s.healthChecker.mu.Lock()
+	defer s.healthChecker.mu.Unlock()
+	
+	now := time.Now()
+	for stagID, health := range s.healthChecker.stagHealth {
+		// Check if stag is stale (no activity for 5 minutes)
+		if now.Sub(health.LastActivity) > 5*time.Minute {
+			health.Healthy = false
+		}
+		
+		// Log health status
+		s.logger.LogStagHealth(stagID, health.Healthy, health.AnchorCount, health.LastActivity)
 	}
 	
-	if event.CameraData != nil {
-		hasher.Write([]byte(fmt.Sprintf("%d", len(event.CameraData.ImageData))))
-		hasher.Write([]byte(fmt.Sprintf("%v", event.CameraData.Intrinsics)))
-	}
+	s.healthChecker.lastHealthCheck = now
 	
-	if event.DepthData != nil {
-		hasher.Write([]byte(fmt.Sprintf("%v", event.DepthData.Data)))
-	}
-	
-	if event.PointCloudData != nil {
-		hasher.Write([]byte(fmt.Sprintf("%v", event.PointCloudData.Points)))
-	}
-	
-	if event.LightingData != nil {
-		hasher.Write([]byte(fmt.Sprintf("%v", event.LightingData.AmbientIntensity)))
-	}
-	
-	return fmt.Sprintf("%x", hasher.Sum(nil))
+	// Log performance metrics
+	s.logger.LogPerformanceMetrics()
 }
 
 // Query handlers
 
 func (s *Service) HandleListStags(w http.ResponseWriter, r *http.Request) {
+	ctx := &logging.PipelineContext{
+		Component: "stag-query",
+	}
+	
+	stopTimer := s.logger.StartTimer()
+	defer func() {
+		duration := stopTimer()
+		s.logger.PipelineDebug(ctx, "List stags query completed", "duration", duration)
+	}()
+	
 	stags, err := s.store.ListStags()
 	if err != nil {
-		s.logger.Error("Failed to list stags", "error", err)
+		s.logger.PipelineError(ctx, "Failed to list stags", "error", err)
 		http.Error(w, "Failed to list stags", http.StatusInternalServerError)
 		return
 	}
 
+	s.logger.PipelineInfo(ctx, "📋 Listed stags", "count", len(stags))
+	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stags)
 }

@@ -168,12 +168,29 @@ Once running, find your connection details:
 
 ## 📱 Connecting StreamKit Devices
 
-### Connection URL for StreamKit:
+### Quick Connection Setup:
+1. **Start the pipeline**: `./start.sh`
+2. **Get your connection URL**: The startup script will display your WebSocket URL
+3. **Connect StreamKit**: Use the displayed URL in your app
+
+### Connection URL Format:
 ```
 ws://[YOUR_LAN_IP]:8080/ws/streamkit?session_id=your_session&device_id=your_device
 ```
 
-### Example:
+### Getting Your LAN IP:
+```bash
+# Option 1: Use relay tool to get LAN IP
+./bin/relay -ip
+
+# Option 2: Check startup output
+./start.sh  # Look for "WebSocket URL" in output
+
+# Option 3: Manual lookup (macOS/Linux)
+ifconfig | grep "inet " | grep -v 127.0.0.1
+```
+
+### Example Connection:
 If your LAN IP is `192.168.1.100`, configure StreamKit to connect to:
 ```
 ws://192.168.1.100:8080/ws/streamkit?session_id=my_ar_session&device_id=iphone_12
@@ -192,6 +209,208 @@ let streamKit = try StreamKit.quickStart(
     streams: [.mesh, .camera, .pose],
     config: config
 )
+```
+
+## 🔍 Querying and Fetching Data from Stags
+
+### REST API Endpoints for Data Access:
+
+#### List All Stags:
+```bash
+curl http://localhost:9000/api/v1/stags
+```
+
+#### Get Specific Stag:
+```bash
+curl http://localhost:9000/api/v1/stags/{stag_id}
+```
+
+#### Get Latest State (All Anchors):
+```bash
+curl http://localhost:9000/api/v1/stags/{stag_id}/anchors
+```
+
+#### Get Specific Anchor:
+```bash
+curl http://localhost:9000/api/v1/stags/{stag_id}/anchors/{anchor_id}
+```
+
+#### Get Anchor Version History:
+```bash
+curl "http://localhost:9000/api/v1/stags/{stag_id}/anchors/{anchor_id}/history"
+
+# With pagination:
+curl "http://localhost:9000/api/v1/stags/{stag_id}/anchors/{anchor_id}/history?offset=0&limit=10"
+```
+
+#### Get System Statistics:
+```bash
+curl http://localhost:9000/api/v1/stats
+```
+
+#### Get Stag-Specific Statistics:
+```bash
+curl http://localhost:9000/api/v1/stats/{stag_id}
+```
+
+### Example Workflow - Fetching Latest Spatial Data:
+
+```bash
+# 1. List available stags
+STAGS=$(curl -s http://localhost:9000/api/v1/stags)
+echo "$STAGS" | jq '.[].id'  # Show all stag IDs
+
+# 2. Get the latest state of a specific stag
+STAG_ID="your-session-id"
+curl -s "http://localhost:9000/api/v1/stags/$STAG_ID/anchors" | jq .
+
+# 3. Get history for a specific anchor
+ANCHOR_ID="mesh_client_1"
+curl -s "http://localhost:9000/api/v1/stags/$STAG_ID/anchors/$ANCHOR_ID/history" | jq .
+
+# 4. Monitor real-time stats
+watch -n 2 'curl -s http://localhost:9000/api/v1/stats | jq .'
+```
+
+### Developer Integration Examples:
+
+#### JavaScript/Node.js:
+```javascript
+// Fetch latest spatial data
+async function getLatestSpatialData(stagId) {
+    const response = await fetch(`http://localhost:9000/api/v1/stags/${stagId}/anchors`);
+    const anchors = await response.json();
+    
+    return anchors.map(anchor => ({
+        id: anchor.id,
+        transform: anchor.current_version?.transform,
+        mesh: anchor.current_version?.mesh_data,
+        lastUpdated: anchor.updated_at
+    }));
+}
+
+// Monitor for changes
+async function pollForUpdates(stagId, callback, intervalMs = 1000) {
+    let lastUpdate = new Date(0);
+    
+    setInterval(async () => {
+        const stag = await fetch(`http://localhost:9000/api/v1/stags/${stagId}`).then(r => r.json());
+        
+        if (new Date(stag.updated_at) > lastUpdate) {
+            lastUpdate = new Date(stag.updated_at);
+            const anchors = await getLatestSpatialData(stagId);
+            callback(anchors);
+        }
+    }, intervalMs);
+}
+```
+
+#### Python:
+```python
+import requests
+import json
+
+class StagClient:
+    def __init__(self, base_url="http://localhost:9000"):
+        self.base_url = base_url
+    
+    def list_stags(self):
+        response = requests.get(f"{self.base_url}/api/v1/stags")
+        return response.json()
+    
+    def get_stag_anchors(self, stag_id):
+        response = requests.get(f"{self.base_url}/api/v1/stags/{stag_id}/anchors")
+        return response.json()
+    
+    def get_anchor_history(self, stag_id, anchor_id, offset=0, limit=50):
+        response = requests.get(
+            f"{self.base_url}/api/v1/stags/{stag_id}/anchors/{anchor_id}/history",
+            params={"offset": offset, "limit": limit}
+        )
+        return response.json()
+    
+    def get_latest_mesh_data(self, stag_id):
+        anchors = self.get_stag_anchors(stag_id)
+        mesh_anchors = [a for a in anchors if a.get('current_version', {}).get('mesh_data')]
+        
+        return [{
+            'anchor_id': anchor['id'],
+            'vertices': anchor['current_version']['mesh_data']['vertices'],
+            'faces': anchor['current_version']['mesh_data']['faces'],
+            'transform': anchor['current_version']['transform'],
+            'timestamp': anchor['updated_at']
+        } for anchor in mesh_anchors]
+
+# Usage example
+client = StagClient()
+stags = client.list_stags()
+if stags:
+    latest_mesh = client.get_latest_mesh_data(stags[0]['id'])
+    print(json.dumps(latest_mesh, indent=2))
+```
+
+### Data Format Reference:
+
+#### Stag Structure:
+```json
+{
+  "id": "session-123",
+  "name": "Session session-123",
+  "description": "Automatically created from session session-123",
+  "created_at": "2024-01-01T12:00:00Z",
+  "updated_at": "2024-01-01T12:05:00Z",
+  "anchors": {...},
+  "stats": {
+    "anchor_count": 5,
+    "version_count": 23,
+    "event_count": 150,
+    "session_count": 1,
+    "client_count": 2,
+    "device_count": 1,
+    "last_activity": "2024-01-01T12:05:00Z"
+  }
+}
+```
+
+#### Anchor Structure:
+```json
+{
+  "id": "mesh_client_1",
+  "stag_id": "session-123",
+  "current_hash": "abc123...",
+  "versions": [...],
+  "created_at": "2024-01-01T12:00:00Z",
+  "updated_at": "2024-01-01T12:05:00Z",
+  "last_session_id": "session-123",
+  "last_client_id": "client-1",
+  "last_device_id": "device-1"
+}
+```
+
+#### Anchor Version (with spatial data):
+```json
+{
+  "version_id": "v1704110400",
+  "hash": "def456...",
+  "timestamp": "2024-01-01T12:00:00Z",
+  "change_type": "update",
+  "transform": {
+    "translation": [0.0, 0.0, 0.0],
+    "rotation": [0.0, 0.0, 0.0, 1.0],
+    "scale": [1.0, 1.0, 1.0]
+  },
+  "mesh_data": {
+    "anchor_id": "mesh_client_1",
+    "vertices": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    "faces": [0, 1, 2],
+    "classification": "floor",
+    "confidence": 0.95
+  },
+  "event_id": "event-123",
+  "session_id": "session-123",
+  "client_id": "client-1",
+  "frame_number": 42
+}
 ```
 
 ## 💡 Common Operations
